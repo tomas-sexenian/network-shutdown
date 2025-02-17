@@ -2,6 +2,7 @@ import time
 import uuid
 import os
 import socket
+import requests
 from concurrent.futures import ThreadPoolExecutor
 from scapy.all import ARP, Ether, sendp, srp
 
@@ -28,12 +29,38 @@ def get_local_ip():
 
 
 def get_mac(ip):
-    arp_request = ARP(pdst=ip)
+    arp_req = ARP(pdst=ip)
     broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
-    packet = broadcast / arp_request
+    packet = broadcast / arp_req
     result = srp(packet, timeout=2, verbose=0)[0]
     for sent, received in result:
         return received.hwsrc
+
+
+def get_hostname(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except Exception:
+        return "Unknown"
+
+
+def get_vendor(mac):
+    try:
+        response = requests.get(f"https://api.macvendors.com/{mac}", timeout=3)
+        if response.status_code == 200:
+            return response.text
+    except Exception:
+        pass
+    return "Unknown"
+
+
+def get_device_label(ip, mac):
+    hostname = get_hostname(ip)
+    vendor = get_vendor(mac)
+    if hostname == ip or hostname == "Unknown":
+        return vendor if vendor != "Unknown" else ip
+    else:
+        return f"{hostname} ({vendor})" if vendor != "Unknown" else hostname
 
 
 def restore_connection(target_ip):
@@ -64,9 +91,9 @@ def get_network():
 
 
 def scan_network(network):
-    arp = ARP(pdst=network)
+    arp_req = ARP(pdst=network)
     ether = Ether(dst="ff:ff:ff:ff:ff:ff")
-    packet = ether / arp
+    packet = ether / arp_req
     result = srp(packet, timeout=2, verbose=0)[0]
     devices = []
     for sent, received in result:
@@ -97,8 +124,9 @@ def main():
         print("No devices found (excluding the local device).")
         return
     print("Devices found:")
-    for i, device in enumerate(devices, 1):
-        print(f"{i}. IP: {device['ip']}, MAC: {device['mac']}")
+    for i, d in enumerate(devices, 1):
+        label = get_device_label(d['ip'], d['mac'])
+        print(f"{i}. IP: {d['ip']}, MAC: {d['mac']}, Name: {label}")
     selected = input("Enter device numbers to attack (comma separated) or 'all' to attack all devices: ").strip()
     target_ips = []
     if selected.lower() == "all":
